@@ -2,48 +2,53 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
+from matplotlib.animation import FuncAnimation
+from scipy.interpolate import BSpline
+import random
+
+X_history = []
 
 # ── Config ─────────────────────────────────────────────────────────────────
 START = (5.0,  5.0,  math.pi * 0.25)   # slight upward heading
 GOAL  = (95.0, 95.0, math.pi * 0.25)
-RHO   = 4.0                             # turning radius (hardcoded, kept small)
+RHO   = 10.0                             # turning radius (hardcoded, kept small)
 
 # Two horizontal walls — clear corridor exists ABOVE (y > 64) and BELOW (y < 36)
 WALLS = [(15, 30, 30, 72), (55, 42, 85, 60)]
 
-# ── Dubins solver ───────────────────────────────────────────────────────────
-def mod2pi(a): return a % (2 * math.pi)
+def build_bspline(control_pts, degree=3, n_samples=200):
+    control_pts = np.array(control_pts)
 
-def _dubins_candidates(alpha, beta, d):
-    sa, ca = math.sin(alpha), math.cos(alpha)
-    sb, cb = math.sin(beta),  math.cos(beta)
-    out = []
-    v = 2+d*d-2*(ca*cb+sa*sb-d*(sa-sb))
-    if v>=0: p=math.sqrt(v); th=math.atan2(cb-ca,d+sa-sb); out.append((mod2pi(-alpha+th),p,mod2pi(beta-th),'LSL'))
-    v = 2+d*d-2*(ca*cb+sa*sb-d*(sb-sa))
-    if v>=0: p=math.sqrt(v); th=math.atan2(ca-cb,d-sa+sb); out.append((mod2pi(alpha-th),p,mod2pi(-beta+th),'RSR'))
-    v = -2+d*d+2*(ca*cb+sa*sb+d*(sa+sb))
-    if v>=0: p=math.sqrt(v); th=math.atan2(-ca-cb,d+sa+sb)-math.atan2(-2,p); out.append((mod2pi(-alpha+th),p,mod2pi(-beta+th),'LSR'))
-    v = d*d-2+2*(ca*cb+sa*sb-d*(sa+sb))
-    if v>=0: p=math.sqrt(v); th=math.atan2(ca+cb,d-sa-sb)-math.atan2(2,p); out.append((mod2pi(alpha-th),p,mod2pi(beta-th),'RSL'))
-    v = (6-d*d+2*(ca*cb+sa*sb+d*(sa-sb)))/8
-    if abs(v)<=1:
-        p=mod2pi(2*math.pi-math.acos(np.clip(v,-1,1))); th=math.atan2(ca-cb,d-sa+sb)
-        t=mod2pi(alpha-th+p/2); out.append((t,p,mod2pi(alpha-beta-t+p),'RLR'))
-    v = (6-d*d+2*(ca*cb+sa*sb-d*(sa-sb)))/8
-    if abs(v)<=1:
-        p=mod2pi(2*math.pi-math.acos(np.clip(v,-1,1))); th=math.atan2(-ca+cb,d+sa-sb)
-        t=mod2pi(-alpha+th+p/2); out.append((t,p,mod2pi(beta-alpha-t+p),'LRL'))
-    return out
+    n = len(control_pts)
+    k = degree
 
-def dubins(q0, q1, rho):
-    dx=(q1[0]-q0[0])/rho; dy=(q1[1]-q0[1])/rho; d=math.sqrt(dx*dx+dy*dy)
-    if d<1e-6: return None
-    th=mod2pi(math.atan2(dy,dx))
-    cands=_dubins_candidates(mod2pi(q0[2]-th), mod2pi(q1[2]-th), d)
-    if not cands: return None
-    t,p,q,w=min(cands, key=lambda c:c[0]+c[1]+c[2])
-    return (t+p+q)*rho, t*rho, p*rho, q*rho, w
+    # clamped knot vector
+    knots = np.concatenate((
+        np.zeros(k),
+        np.linspace(0, 1, n - k + 1),
+        np.ones(k)
+    ))
+
+    t = np.linspace(0, 1, n_samples)
+
+    spline_x = BSpline(knots, control_pts[:,0], k)
+    spline_y = BSpline(knots, control_pts[:,1], k)
+
+    x = spline_x(t)
+    y = spline_y(t)
+
+    dx = spline_x.derivative(1)(t)
+    dy = spline_y.derivative(1)(t)
+
+    ddx = spline_x.derivative(2)(t)
+    ddy = spline_y.derivative(2)(t)
+
+    return x, y, dx, dy, ddx, ddy
+
+def compute_curvature(dx, dy, ddx, ddy):
+    num = np.abs(dx * ddy - dy * ddx)
+    denom = (dx**2 + dy**2)**1.5 + 1e-6
+    return num / denom
 
 def sample_seg(x, y, th, L, kind, rho, n=80):
     pts = []
@@ -66,13 +71,6 @@ def sample_seg(x, y, th, L, kind, rho, n=80):
             phi = th - a; pts.append((cx-rho*math.sin(phi), cy+rho*math.cos(phi)))
         th -= da; x, y = pts[-1]
     return pts, x, y, th
-
-def sample_dubins(q0, t, p, q, word, rho):
-    all_pts=[]; x,y,th=q0
-    for L,kind in zip([t,p,q], word):
-        pts,x,y,th = sample_seg(x,y,th,L,kind,rho)
-        all_pts.extend(pts)
-    return np.array(all_pts)
 
 # ── Collision helpers ───────────────────────────────────────────────────────
 def pt_in_wall(px, py, wall, mg=0.3):
@@ -162,81 +160,221 @@ def assign_headings(pts, start_th, goal_th):
                              math.cos(th_in)+math.cos(th_out))
     return ths
 
-ths = assign_headings(rrt_pruned, START[2], GOAL[2])
-configs = [(rrt_pruned[i][0], rrt_pruned[i][1], ths[i]) for i in range(len(rrt_pruned))]
-# Force exact start and goal configs
-configs[0]  = START
-configs[-1] = GOAL
+def particle_swarm(f, x_lb, x_ub, n=10, inertia=0.5, self_influence=1.8, social_influence=1.8, max_vel=1.0, f_tol=1e-6):
+    global nfev
+    global X_history
+    nfev = 0
+    X_history = []
 
-# ── Build Dubins path and verify ────────────────────────────────────────────
-all_pts = []
-total_len = 0
-collision = False
-print("\nDubins segments:")
-for i in range(len(configs)-1):
-    res = dubins(configs[i], configs[i+1], RHO)
-    if res is None:
-        print(f"  Seg {i}: no path found"); continue
-    length, t, p, q, word = res
-    total_len += length
-    pts = sample_dubins(configs[i], t, p, q, word, RHO)
-    if not arc_clear(pts, WALLS): collision = True
-    all_pts.append(pts)
-    print(f"  Seg {i}: {word}  len={length:.1f}")
+    k = 0
+    X = np.zeros((n, len(x_lb)))
+    dX = np.zeros((n, len(x_lb)))
 
-# Concatenate segments, dropping the duplicate first point of each segment
-# (which equals the last point of the previous one) to avoid LineCollection
-# drawing a stray line across any floating-point gap at joins.
-continuous = [all_pts[0]]
-for seg in all_pts[1:]:
-    continuous.append(seg[1:])   # skip index 0 — it duplicates previous end
-# Force exact goal as final point
-continuous.append(np.array([[GOAL[0], GOAL[1]]]))
-smooth = np.vstack(continuous)
-status = "⚠ Arc clips obstacle" if collision else "✓ Collision-free"
-print(f"\n{status}  |  Total length: {total_len:.1f}  |  rho={RHO}")
+    for i in range(n):
+        X[i,:] = x_lb + (x_ub - x_lb) * np.random.rand(len(x_lb))
+        dX[i,:] = (np.random.rand(len(x_lb))*2 - 1) * max_vel     
+    X_best = X.copy()
+    f_vals_best = np.array([f(xi) for xi in X_best])
 
-# ── Plot ────────────────────────────────────────────────────────────────────
+    n_conv = 0
+    f_best_prev = np.inf
+    converged = False
+    while not converged:
+        k += 1
+        f_vals = np.array([f(xi) for xi in X])
+        swarm_best_i = 0
+        for i in range(n):
+            if f_vals[i] < f_vals_best[i]:
+                X_best[i,:] = X[i,:]
+                f_vals_best[i] = f_vals[i]
+            if f_vals[i] < f_vals[swarm_best_i]:
+                swarm_best_i = i
+
+        swarm_best = X[swarm_best_i,:].copy()
+
+        for i in range(n):
+            dX[i,:] = inertia*dX[i,:] + self_influence*(X_best[i,:]-X[i,:]) + social_influence*(swarm_best - X[i,:])
+            dX[i,:] = np.maximum(np.minimum(dX[i,:], max_vel),-max_vel)
+            X[i,:] += dX[i,:]
+            X[i,:] = np.maximum(np.minimum(X[i,:], x_ub), x_lb)
+        
+            for j in range(len(x_lb)):
+                if X[i,j] < x_lb[j]:
+                    X[i,j] = x_lb[j]
+                    dX[i,j] *= -0.5
+
+                elif X[i,j] > x_ub[j]:
+                    X[i,j] = x_ub[j]
+                    dX[i,j] *= -0.5
+
+        f_min = np.min(f_vals_best)
+
+        if np.abs(f_best_prev - f_min) < f_tol:
+            n_conv += 1
+            if n_conv > 2:
+                converged = True
+        else:
+            n_conv = 0
+
+        f_best_prev = f_min
+
+        X_history.append(X.copy())
+        r_x = X_best[np.argmin(f_vals_best)]
+    return r_x, f(r_x), nfev
+
+def visualize_swarm(X_history, x_lb, x_ub, title="PSO Animation"):
+
+    fig, ax = plt.subplots()
+    ax.set_xlim(x_lb[0], x_ub[0])
+    ax.set_ylim(x_lb[1], x_ub[1])
+
+    n_particles = X_history[0].shape[0]
+
+    # scatter for particles
+    scatter = ax.scatter([], [], s=50)
+
+    # one line per particle
+    lines = [ax.plot([], [], lw=1)[0] for _ in range(n_particles)]
+
+    # egg carton contour (fast vectorized form)
+    x = np.linspace(x_lb[0], x_ub[0], 100)
+    y = np.linspace(x_lb[1], x_ub[1], 100)
+    Xg, Yg = np.meshgrid(x, y)
+    Z = 0.1*Xg**2 + 0.1*Yg**2 - np.cos(3*Xg) - np.cos(3*Yg)
+
+    ax.contour(Xg, Yg, Z, levels=20, alpha=0.5)
+
+    def update(frame):
+
+        X = X_history[frame]
+        scatter.set_offsets(X)
+
+        if frame > 0:
+            X_prev = X_history[frame-1]
+
+            for i, line in enumerate(lines):
+                line.set_data(
+                    [X_prev[i,0], X[i,0]],
+                    [X_prev[i,1], X[i,1]]
+                )
+
+        ax.set_title(f"Particle Swarm")
+
+        return [scatter] + lines
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=len(X_history),
+        interval=200,
+        blit=True
+    )
+
+    plt.show()
+
+def build_spline_from_x(x):
+    pts = [START[:2]]
+
+    for i in range(0, len(x), 2):
+        pts.append((x[i], x[i+1]))
+
+    pts.append(GOAL[:2])
+
+    x_s, y_s, dx, dy, ddx, ddy = build_bspline(pts)
+
+    curvature = compute_curvature(dx, dy, ddx, ddy)
+
+    # arc length
+    ds = np.sqrt(dx**2 + dy**2)
+    length = np.sum(ds)
+
+    # collision
+    collision = False
+    for px, py in zip(x_s, y_s):
+        for w in WALLS:
+            if pt_in_wall(px, py, w):
+                collision = True
+
+    return x_s, y_s, length, curvature, collision
+
+def objective(x):
+    x_s, y_s, length, curvature, collision = build_spline_from_x(x)
+
+    # curvature constraint
+    kappa_max = 1.0 / RHO
+    curvature_violation = np.maximum(0, curvature - kappa_max)
+
+    curvature_penalty = np.sum(curvature_violation**2) * 1e4
+
+    collision_penalty = 1e6 if collision else 0
+
+    return length + curvature_penalty + collision_penalty
+
+# ── Build bounds from RRT path ─────────────────────────────────────────────
+margin = 10.0
+lb = []
+ub = []
+
+for (x, y) in rrt_pruned[1:-1]:
+    lb.extend([max(0, x - margin), max(0, y - margin)])
+    ub.extend([min(100, x + margin), min(100, y + margin)])
+
+lb = np.array(lb)
+ub = np.array(ub)
+
+print("Optimization dim:", len(lb))
+
+# ── Run PSO ────────────────────────────────────────────────────────────────
+x_opt, f_opt, _ = particle_swarm(
+    objective,
+    lb,
+    ub,
+    n=20,
+    max_vel=5.0   # IMPORTANT: reduced from 100
+)
+
+visualize_swarm(X_history, lb, ub, objective)
+
+print("Optimized cost:", f_opt)
+
+x_s, y_s, length, curvature, collision = build_spline_from_x(x_opt)
+
+print("Length:", length)
+print("Max curvature:", np.max(curvature))
+print("Allowed:", 1.0 / RHO)
+
+# ── Plot optimized result ──────────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(9,9))
-ax.set_facecolor('#0d0d1a'); fig.patch.set_facecolor('#0d0d1a')
+ax.set_facecolor('#0d0d1a')
 
-# Obstacles
+# obstacles
 for w in WALLS:
-    ax.add_patch(plt.Polygon([(w[0],w[1]),(w[2],w[1]),(w[2],w[3]),(w[0],w[3])],
-        closed=True, fc='#922b21', ec='#e74c3c', lw=1.5, alpha=0.9, zorder=2))
-    ax.text((w[0]+w[2])/2,(w[1]+w[3])/2,'WALL',ha='center',va='center',
-            color='#faa',fontsize=8,fontweight='bold',zorder=3)
+    ax.add_patch(plt.Polygon(
+        [(w[0],w[1]),(w[2],w[1]),(w[2],w[3]),(w[0],w[3])],
+        closed=True, fc='#922b21', ec='#e74c3c', alpha=0.9
+    ))
 
-# Smooth Dubins path
-pts_r = smooth.reshape(-1,1,2)
-segs  = np.concatenate([pts_r[:-1], pts_r[1:]], axis=1)
-lc = LineCollection(segs, cmap='plasma', lw=2.5, zorder=4, alpha=0.95)
-lc.set_array(np.linspace(0,1,len(segs)))
+# spline path
+points = np.array([x_s, y_s]).T.reshape(-1,1,2)
+segs = np.concatenate([points[:-1], points[1:]], axis=1)
+
+lc = LineCollection(segs, cmap='plasma', lw=2.5)
+lc.set_array(curvature)
 ax.add_collection(lc)
 
-# Waypoints (pruned RRT nodes, excluding start/goal)
-wx = [c[0] for c in configs[1:-1]]
-wy = [c[1] for c in configs[1:-1]]
-ax.scatter(wx, wy, c='#f39c12', s=65, zorder=6,
-           marker='D', edgecolors='white', lw=0.8, label='Waypoints')
+# control points
+wps = [(x_opt[i], x_opt[i+1]) for i in range(0, len(x_opt), 2)]
+if wps:
+    wx, wy = zip(*wps)
+    ax.scatter(wx, wy, c='yellow', s=70, edgecolors='white')
 
-# Start / Goal
-ax.plot(*START[:2],'o',color='#2ecc71',ms=13,zorder=7,mec='white',mew=1.5,label='Start')
-ax.plot(*GOAL[:2], '*',color='#e74c3c',ms=17,zorder=7,mec='white',mew=1.5,label='Goal')
-ax.text(START[0]+1.5, START[1]-4,'START',color='#2ecc71',fontsize=8,fontweight='bold',zorder=8)
-ax.text(GOAL[0]-10,   GOAL[1]+2, 'GOAL', color='#e74c3c',fontsize=8,fontweight='bold',zorder=8)
+# start/goal
+ax.plot(*START[:2],'o',color='#2ecc71',ms=12)
+ax.plot(*GOAL[:2],'*',color='#e74c3c',ms=16)
 
-ax.set_xlim(0,100); ax.set_ylim(0,100); ax.set_aspect('equal')
-ax.grid(True,color='#1a1a2e',lw=0.6)
-ax.tick_params(colors='#555')
-for sp in ax.spines.values(): sp.set_edgecolor('#333')
-ax.legend(facecolor='#16213e',edgecolor='#444',labelcolor='white',fontsize=9,loc='lower right')
-ax.set_title("Dubins Path  —  RRT skeleton + arc smoothing",color='white',fontsize=13,pad=10)
-col_color = '#aaa' if not collision else '#e74c3c'
-ax.text(1,98,f"{status}   |   Length: {total_len:.1f}   |   ρ = {RHO}",
-        color=col_color,fontsize=8,va='top')
+ax.set_xlim(0,100)
+ax.set_ylim(0,100)
+ax.set_aspect('equal')
 
-plt.tight_layout()
-plt.savefig('dubins_path.png', dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+plt.title(f"B-Spline Path | Length={length:.1f}")
 plt.show()
-print("Saved dubins_path.png")
