@@ -1,66 +1,8 @@
-# --- PSO from pathfinder_6_4.py ---
-def particle_swarm_6_4(f, x_lb, x_ub, n=10, inertia=0.5, self_influence=1.8, social_influence=1.8, max_vel=1.0, f_tol=1e-6):
-    global nfev
-    global X_history
-    nfev = 0
-    X_history = []
 
-    k = 0
-    lhs_raw = lhsmdu.sample(len(x_lb), n)
-    lhs_samples = np.array(lhs_raw).T
-    X = x_lb + (x_ub - x_lb) * lhs_samples
-    dX = (np.random.rand(n, len(x_lb))*2 - 1) * max_vel     
-    X_best = X.copy()
-    f_vals_best = np.array([f(xi) for xi in X_best])
-
-    n_conv = 0
-    f_best_prev = np.inf
-    converged = False
-    while not converged:
-        k += 1
-        f_vals = np.array([f(xi) for xi in X])
-        swarm_best_i = 0
-        for i in range(n):
-            if f_vals[i] < f_vals_best[i]:
-                X_best[i,:] = X[i,:]
-                f_vals_best[i] = f_vals[i]
-            if f_vals[i] < f_vals[swarm_best_i]:
-                swarm_best_i = i
-
-        swarm_best = X[swarm_best_i,:].copy()
-
-        for i in range(n):
-            dX[i,:] = inertia*dX[i,:] + self_influence*(X_best[i,:]-X[i,:]) + social_influence*(swarm_best - X[i,:])
-            dX[i,:] = np.maximum(np.minimum(dX[i,:], max_vel),-max_vel)
-            X[i,:] += dX[i,:]
-            X[i,:] = np.maximum(np.minimum(X[i,:], x_ub), x_lb)
-            for j in range(len(x_lb)):
-                if X[i,j] < x_lb[j]:
-                    X[i,j] = x_lb[j]
-                    dX[i,j] *= -0.5
-                elif X[i,j] > x_ub[j]:
-                    X[i,j] = x_ub[j]
-                    dX[i,j] *= -0.5
-
-        f_min = np.min(f_vals_best)
-
-        if np.abs(f_best_prev - f_min) < f_tol:
-            n_conv += 1
-            if n_conv > 2:
-                converged = True
-        else:
-            n_conv = 0
-
-        f_best_prev = f_min
-
-        X_history.append(X.copy())
-        r_x = X_best[np.argmin(f_vals_best)]
-        max_vel *= 0.9
-    return r_x, f(r_x), nfev
+# Core imports
 import numpy as np
 import math
 import os
-import importlib.util
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -69,40 +11,40 @@ from scipy.optimize import minimize, Bounds, NonlinearConstraint
 import lhsmdu
 import heapq
 
-X_history = []
-
-# ── Config ─────────────────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────
 WORLD_SCALE = 1000.0
 RRT_STEP = 0.05 * WORLD_SCALE
 RRT_GOAL_RADIUS = 0.08 * WORLD_SCALE
 COLLISION_SAMPLE_SPACING = 0.005 * WORLD_SCALE
 LOCAL_BOUNDS_MARGIN = 0.10 * WORLD_SCALE
-RHO   = 4.0                    # turning radius stays in meters
+RHO   = 4.0                    # turning radius in meters
 N_BOXES = 14
 BOX_SEED = 23
-SAVE_GIFS = False
+SAVE_GIFS = True
 COLLISION_CLEARANCE = 0.0
 COLLISION_CONSTRAINT_SAMPLES = 260
 Z_HEADROOM = 10.0
-IPM_MAX_ITERS = 700
+IPM_MAX_ITERS = 100
 IPM_ACCEPT_MARGIN = 0.3
 RUN_IPM_FROM_RRT = True
 RUN_GCS = True
 
 # Solver toggles
-RUN_PSO_CURRENT = False
-RUN_PSO_LEGACY = True
-RUN_PSO_6_4 = False
+RUN_PSO = True
 RUN_IPM_ON_TOP_OF_PSO = True
 
 # Plot toggles
-PLOT_PSO_CURRENT = False
-PLOT_PSO_LEGACY = True
-PLOT_PSO_6_4 = False
+PLOT_PSO = True
 PLOT_IPM_FROM_RRT = True
 PLOT_PSO_IPM = True
 PLOT_GCS = True
 
+
+# For PSO animation
+X_history = []
+
+
+# Check if two boxes overlap in XY (for obstacle generation)
 def boxes_overlap_xy(a, b, gap=0.015):
     return not (
         a[3] + gap <= b[0] or b[3] + gap <= a[0] or
@@ -110,11 +52,11 @@ def boxes_overlap_xy(a, b, gap=0.015):
     )
 
 
+# Generate random non-overlapping boxes for obstacles
 def generate_base_boxes(n_boxes=N_BOXES, seed=BOX_SEED, max_attempts=25000):
     rng = np.random.default_rng(seed)
     boxes = []
     pad = 0.04
-
     for _ in range(max_attempts):
         width = rng.uniform(0.07, 0.14)
         depth = rng.uniform(0.07, 0.15)
@@ -122,14 +64,11 @@ def generate_base_boxes(n_boxes=N_BOXES, seed=BOX_SEED, max_attempts=25000):
         x0 = rng.uniform(pad, 1.0 - pad - width)
         y0 = rng.uniform(pad, 1.0 - pad - depth)
         candidate = (x0, y0, 0.0, x0 + width, y0 + depth, height)
-
         if all(not boxes_overlap_xy(candidate, existing) for existing in boxes):
             boxes.append(candidate)
             if len(boxes) == n_boxes:
                 return boxes
-
     raise RuntimeError("Failed to generate non-overlapping boxes.")
-
 
 # Box obstacles are generated in normalized map units and then scaled into meters.
 # Box format: (x_min, y_min, z_min, x_max, y_max, z_max)
@@ -139,64 +78,15 @@ BOXES = [tuple(value * WORLD_SCALE for value in box) for box in BASE_BOXES]
 TALLEST_BOX_Z = max(box[5] for box in BOXES)
 SPACE_BOUNDS = (0.0, WORLD_SCALE, 0.0, WORLD_SCALE, 0.0, TALLEST_BOX_Z + Z_HEADROOM)
 
+# Lower left open corner (safe margin from edge and obstacles)
 START_Z = 5.0
-
-def sample_free_point(rng, boxes, x_bounds, y_bounds, z_bounds, xy_margin=0.0, z_margin=0.0, obstacle_margin=0.0, max_attempts=5000):
-    x_lo, x_hi = x_bounds
-    y_lo, y_hi = y_bounds
-    z_lo, z_hi = z_bounds
-
-    for _ in range(max_attempts):
-        candidate = np.array([
-            rng.uniform(x_lo + xy_margin, x_hi - xy_margin),
-            rng.uniform(y_lo + xy_margin, y_hi - xy_margin),
-            z_lo if abs(z_hi - z_lo) < 1e-9 else rng.uniform(z_lo + z_margin, z_hi - z_margin),
-        ])
-        if not any(
-            box[0] - obstacle_margin <= candidate[0] <= box[3] + obstacle_margin and
-            box[1] - obstacle_margin <= candidate[1] <= box[4] + obstacle_margin and
-            box[2] - obstacle_margin <= candidate[2] <= box[5] + obstacle_margin
-            for box in boxes
-        ):
-            return tuple(candidate)
-
-    raise RuntimeError("Failed to sample a free point outside the boxes.")
-
-rng = np.random.default_rng(7)
-START = sample_free_point(
-    rng,
-    BOXES,
-    (SPACE_BOUNDS[0], SPACE_BOUNDS[1]),
-    (SPACE_BOUNDS[2], SPACE_BOUNDS[3]),
-    (START_Z, START_Z),
-    xy_margin=0.05 * WORLD_SCALE,
-    z_margin=0.0,
-)
-
-
+START = (80.0, 120.0, START_Z)
+# Upper right open corner (safe margin from edge and obstacles)
 GOAL_Z = 0.5 * TALLEST_BOX_Z
-GOAL = sample_free_point(
-    rng,
-    BOXES,
-    (SPACE_BOUNDS[0], SPACE_BOUNDS[1]),
-    (SPACE_BOUNDS[2], SPACE_BOUNDS[3]),
-    (GOAL_Z, GOAL_Z),
-    xy_margin=0.05 * WORLD_SCALE,
-    z_margin=0.0,
-)
-
-while math.dist(START, GOAL) < 0.20 * WORLD_SCALE:
-    GOAL = sample_free_point(
-        rng,
-        BOXES,
-        (SPACE_BOUNDS[0], SPACE_BOUNDS[1]),
-        (SPACE_BOUNDS[2], SPACE_BOUNDS[3]),
-        (GOAL_Z, GOAL_Z),
-        xy_margin=0.05 * WORLD_SCALE,
-        z_margin=0.0,
-    )
+GOAL = (920.0, 880.0, GOAL_Z)
 
 def build_bspline(control_pts, degree=3, n_samples=200):
+    """Build a B-spline curve from control points."""
     control_pts = np.array(control_pts)
 
     n = len(control_pts)
@@ -230,35 +120,17 @@ def build_bspline(control_pts, degree=3, n_samples=200):
     return x, y, z, dx, dy, dz, ddx, ddy, ddz
 
 def compute_curvature(dx, dy, dz, ddx, ddy, ddz):
+    """Compute curvature along a 3D curve."""
     v1 = np.stack([dx, dy, dz], axis=1)
     v2 = np.stack([ddx, ddy, ddz], axis=1)
     num = np.linalg.norm(np.cross(v1, v2), axis=1)
     denom = np.linalg.norm(v1, axis=1)**3 + 1e-6
     return num / denom
 
-def sample_seg(x, y, z, th, L, kind, rho, n=80):
-    pts = []
-    if kind == 'S':
-        ss = np.linspace(0, L, max(3, int(L/0.3)+1))
-        for s in ss: pts.append((x+s*math.cos(th), y+s*math.sin(th), z))
-        x += L*math.cos(th); y += L*math.sin(th)
-    elif kind == 'L':
-        cx = x - rho*math.sin(th); cy = y + rho*math.cos(th)
-        da = L / rho
-        ns = max(3, int(da*rho/0.3)+1)
-        for a in np.linspace(0, da, ns):
-            phi = th + a; pts.append((cx+rho*math.sin(phi), cy-rho*math.cos(phi), z))
-        th += da; x, y, z = pts[-1]
-    else:  # R
-        cx = x + rho*math.sin(th); cy = y - rho*math.cos(th)
-        da = L / rho
-        ns = max(3, int(da*rho/0.3)+1)
-        for a in np.linspace(0, da, ns):
-            phi = th - a; pts.append((cx-rho*math.sin(phi), cy+rho*math.cos(phi), z))
-        th -= da; x, y, z = pts[-1]
-    return pts, x, y, th
 
 # ── Collision helpers ───────────────────────────────────────────────────────
+
+# Check if a point is inside a box (with margin)
 def pt_in_box(px, py, pz, box, mg=0.3):
     return (
         box[0] - mg <= px <= box[3] + mg and
@@ -275,14 +147,6 @@ def seg_clear(ax, ay, az, bx, by, bz, boxes, mg=0.5):
         pz = az + t * (bz - az)
         for box in boxes:
             if pt_in_box(px, py, pz, box, mg):
-                return False
-    return True
-
-def arc_clear(pts, boxes):
-    arr = np.array(pts)
-    for px, py, pz in arr:
-        for box in boxes:
-            if pt_in_box(px, py, pz, box):
                 return False
     return True
 
@@ -326,7 +190,7 @@ def add_box(ax, box, color='#922b21', edge='#e74c3c', alpha=0.55):
     ax.add_collection3d(Poly3DCollection(faces, facecolors=color, edgecolors=edge, alpha=alpha, linewidths=0.6))
 
 # ── RRT to find collision-free skeleton ────────────────────────────────────
-def rrt(start_xyz, goal_xyz, boxes, n_iter=10000, step=RRT_STEP, goal_r=RRT_GOAL_RADIUS, mg=RHO+0.75):
+def rrt(start_xyz, goal_xyz, boxes, n_iter=30000, step=RRT_STEP, goal_r=RRT_GOAL_RADIUS, mg=RHO+0.75):
     rng = np.random.default_rng(7)
     nodes = [np.array(start_xyz, float)]
     parent = [-1]
@@ -384,123 +248,7 @@ def prune(path, boxes, mg=RHO+0.75):
 rrt_pruned = prune(rrt_path, BOXES)
 print(f"  After pruning: {len(rrt_pruned)} nodes")
 
-def particle_swarm(
-    f,
-    x_lb,
-    x_ub,
-    n=10,
-    inertia=0.5,
-    self_influence=1.8,
-    social_influence=1.8,
-    max_vel=1.0,
-    f_tol=1e-6,
-    max_iters=300,
-    progress_every=25,
-):
-    global nfev
-    global X_history
-    nfev = 0
-    X_history = []
-
-    lhs_raw = lhsmdu.sample(len(x_lb), n)
-    lhs_samples = np.array(lhs_raw).T
-    X = x_lb + (x_ub - x_lb) * lhs_samples
-    for i in range(n):
-        X[i, :] = clip_waypoints_to_obstacle_boundary(X[i, :], x_lb, x_ub, BOXES)
-    dX = (np.random.rand(n, len(x_lb))*2 - 1) * max_vel     
-    X_best = X.copy()
-    f_vals_best = np.full(n, np.inf)
-
-    for i in range(n):
-        fi = f(X[i, :])
-        if is_collision_free_solution(X[i, :]):
-            X_best[i, :] = X[i, :]
-            f_vals_best[i] = fi
-
-    n_conv = 0
-    f_best_prev = np.inf
-    converged = False
-    last_iter = 0
-    for k in range(1, max_iters + 1):
-        last_iter = k
-        f_vals = np.array([f(xi) for xi in X])
-        feasible = np.array([is_collision_free_solution(xi) for xi in X], dtype=bool)
-        for i in range(n):
-            if feasible[i] and f_vals[i] < f_vals_best[i]:
-                X_best[i,:] = X[i,:]
-                f_vals_best[i] = f_vals[i]
-
-        if np.any(feasible):
-            feasible_scores = np.where(feasible, f_vals, np.inf)
-            swarm_best = X[int(np.argmin(feasible_scores)), :].copy()
-        elif np.any(np.isfinite(f_vals_best)):
-            swarm_best = X_best[int(np.argmin(f_vals_best)), :].copy()
-        else:
-            swarm_best = np.mean(X, axis=0)
-
-        for i in range(n):
-            dX[i,:] = inertia*dX[i,:] + self_influence*(X_best[i,:]-X[i,:]) + social_influence*(swarm_best - X[i,:])
-            dX[i,:] = np.maximum(np.minimum(dX[i,:], max_vel),-max_vel)
-            X[i,:] += dX[i,:]
-            X[i,:] = np.maximum(np.minimum(X[i,:], x_ub), x_lb)
-            projected = clip_waypoints_to_obstacle_boundary(X[i, :], x_lb, x_ub, BOXES)
-            if not np.allclose(projected, X[i, :]):
-                dX[i, :] *= 0.5
-                X[i, :] = projected
-        
-            for j in range(len(x_lb)):
-                if X[i,j] < x_lb[j]:
-                    X[i,j] = x_lb[j]
-                    dX[i,j] *= -0.5
-
-                elif X[i,j] > x_ub[j]:
-                    X[i,j] = x_ub[j]
-                    dX[i,j] *= -0.5
-
-        finite_best = f_vals_best[np.isfinite(f_vals_best)]
-        if finite_best.size == 0:
-            if progress_every > 0 and (k % progress_every == 0):
-                print(f"PSO iter {k}: no feasible particles yet")
-            n_conv = 0
-            X_history.append(X.copy())
-            max_vel *= 0.9
-            continue
-
-        f_min = np.min(finite_best)
-
-        if np.abs(f_best_prev - f_min) < f_tol:
-            n_conv += 1
-            if n_conv > 2:
-                converged = True
-        else:
-            n_conv = 0
-
-        f_best_prev = f_min
-
-        X_history.append(X.copy())
-        max_vel *= 0.9
-
-        if progress_every > 0 and (k % progress_every == 0):
-            print(f"PSO iter {k}: best feasible cost = {f_min:.2f}")
-
-        if converged:
-            break
-
-    if not np.any(np.isfinite(f_vals_best)):
-        raise RuntimeError(
-            f"PSO did not find a collision-free solution after {last_iter} iterations. "
-            "Try increasing n, max_iters, or LOCAL_BOUNDS_MARGIN."
-        )
-
-    if not converged:
-        print(f"PSO reached max_iters={max_iters}; returning best feasible particle found.")
-
-    r_x = X_best[int(np.argmin(f_vals_best))]
-    return r_x, f(r_x), nfev
-
-
-def particle_swarm_legacy(f, x_lb, x_ub, n=20, inertia=0.5, self_influence=1.8, social_influence=1.8, max_vel=5.0, f_tol=1e-6, max_iters=300):
-    """Earlier baseline PSO update logic for comparison."""
+def particle_swarm(f, x_lb, x_ub, n=20, inertia=0.5, self_influence=1.8, social_influence=1.8, max_vel=5.0, f_tol=1e-6, max_iters=300):
     global nfev
     global X_history
     nfev = 0
@@ -547,7 +295,7 @@ def particle_swarm_legacy(f, x_lb, x_ub, n=20, inertia=0.5, self_influence=1.8, 
         max_vel *= 0.9
 
     if not converged:
-        print("Legacy PSO reached max_iters; returning best particle found.")
+        print("PSO reached max_iters; returning best particle found.")
 
     r_x = X_best[int(np.argmin(f_vals_best))]
     return r_x, f(r_x), nfev
@@ -694,75 +442,93 @@ def visualize_path_evolution(X_history, objective_fn, output_path, max_frames=80
     plt.close(fig)
 
 
-def visualize_agent_traverse(path_xyz, output_path, max_frames=120, fps=8):
-    """Animate a moving agent along the final path with a chase camera."""
-    if len(path_xyz) < 2:
-        return
 
-    path_xyz = np.asarray(path_xyz, dtype=float)
-    segments = path_xyz[1:] - path_xyz[:-1]
-    lengths = np.linalg.norm(segments, axis=1)
-    total_length = float(np.sum(lengths))
-    if total_length <= 1e-9:
-        return
+def visualize_agents_multi(paths_dict, output_path, max_frames=120, fps=8):
+    """Animate agents for each path, camera above/behind all, panning toward goal."""
+    # paths_dict: {label: (N,3) array}
+    # Find the longest path for frame count
+    n_paths = len(paths_dict)
+    path_pts = {}
+    max_len = 0
+    for label, path_xyz in paths_dict.items():
+        path_xyz = np.asarray(path_xyz, dtype=float)
+        segments = path_xyz[1:] - path_xyz[:-1]
+        lengths = np.linalg.norm(segments, axis=1)
+        total_length = float(np.sum(lengths))
+        samples_per_seg = np.maximum(2, np.ceil(max_frames * (lengths / total_length)).astype(int))
+        pts = []
+        for i, n_samples in enumerate(samples_per_seg):
+            for t in np.linspace(0.0, 1.0, int(n_samples), endpoint=False):
+                pts.append((1.0 - t) * path_xyz[i] + t * path_xyz[i + 1])
+        pts.append(path_xyz[-1])
+        pts = np.asarray(pts)
+        path_pts[label] = pts
+        if len(pts) > max_len:
+            max_len = len(pts)
 
-    samples_per_seg = np.maximum(2, np.ceil(max_frames * (lengths / total_length)).astype(int))
-    pts = []
-    seg_ids = []
-    for i, n_samples in enumerate(samples_per_seg):
-        for t in np.linspace(0.0, 1.0, int(n_samples), endpoint=False):
-            pts.append((1.0 - t) * path_xyz[i] + t * path_xyz[i + 1])
-            seg_ids.append(i)
-    pts.append(path_xyz[-1])
-    seg_ids.append(len(path_xyz) - 2)
-    pts = np.asarray(pts)
+    # Pad all paths to max_len
+    for label in path_pts:
+        pts = path_pts[label]
+        if len(pts) < max_len:
+            pad = np.repeat(pts[-1][None, :], max_len - len(pts), axis=0)
+            path_pts[label] = np.concatenate([pts, pad], axis=0)
 
     fig = plt.figure(figsize=(11, 10))
     ax = fig.add_subplot(111, projection='3d')
     ax.set_facecolor('#0d0d1a')
-
     for box in BOXES:
         add_box(ax, box, alpha=0.22)
-
-    ax.plot(path_xyz[:, 0], path_xyz[:, 1], path_xyz[:, 2], color='#5bc0eb', lw=2.1, alpha=0.45)
+    # Plot all full paths
+    colors = {'PSO': '#ffd166', 'IPM (RRT seed)': '#ff8c42', 'PSO + IPM': '#2ecc71', 'GCS': '#7f7fff'}
+    for label, pts in path_pts.items():
+        ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], color=colors.get(label, None), lw=2.1, alpha=0.45)
     ax.plot([START[0]], [START[1]], [START[2]], 'o', color='#2ecc71', ms=10)
     ax.plot([GOAL[0]], [GOAL[1]], [GOAL[2]], '*', color='#e74c3c', ms=14)
-
-    agent = ax.scatter([], [], [], s=130, c='#ffdd57', edgecolors='black', linewidths=1.0, depthshade=False)
-    trail, = ax.plot([], [], [], color='#00d1ff', lw=3.0)
-    last_heading = [0.0]
-    current_azim = [180.0]
-
+    # One agent per path
+    agents = {}
+    trails = {}
+    for label, pts in path_pts.items():
+        agents[label] = ax.scatter([], [], [], s=130, c=colors.get(label, '#ffdd57'), edgecolors='black', linewidths=1.0, depthshade=False, label=label)
+        trails[label], = ax.plot([], [], [], color=colors.get(label, '#00d1ff'), lw=3.0)
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
     ax.set_box_aspect((1, 1, 0.55))
 
+    # Camera: always above/behind all agents, panning from start toward goal
+    start_xy = np.array([START[0], START[1]])
+    goal_xy = np.array([GOAL[0], GOAL[1]])
+    cam_dir = goal_xy - start_xy
+    cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-9)
+    cam_dist = 0.45 * WORLD_SCALE
+    cam_height = 0.32 * WORLD_SCALE
+    def camera_pos(frame):
+        # Move camera along a line from behind start to behind goal
+        frac = min(1.0, frame / (max_len - 1))
+        base = start_xy - cam_dir * cam_dist * (1 - frac) + cam_dir * cam_dist * frac
+        z = START_Z + cam_height * (1 - frac) + GOAL_Z * frac
+        return np.array([base[0], base[1], z])
+
     def update(frame_i):
-        pos = pts[frame_i]
-        history = pts[: frame_i + 1]
-        agent._offsets3d = ([pos[0]], [pos[1]], [pos[2]])
-        trail.set_data(history[:, 0], history[:, 1])
-        trail.set_3d_properties(history[:, 2])
+        for label, pts in path_pts.items():
+            pos = pts[frame_i]
+            history = pts[: frame_i + 1]
+            agents[label]._offsets3d = ([pos[0]], [pos[1]], [pos[2]])
+            trails[label].set_data(history[:, 0], history[:, 1])
+            trails[label].set_3d_properties(history[:, 2])
+        # Camera setup
+        cam = camera_pos(frame_i)
+        look = goal_xy
+        ax.set_xlim(cam[0] - 0.35 * WORLD_SCALE, cam[0] + 0.35 * WORLD_SCALE)
+        ax.set_ylim(cam[1] - 0.35 * WORLD_SCALE, cam[1] + 0.35 * WORLD_SCALE)
+        ax.set_zlim(max(SPACE_BOUNDS[4], cam[2] - 0.45 * WORLD_SCALE), min(SPACE_BOUNDS[5], cam[2] + 0.45 * WORLD_SCALE))
+        # Set azimuth to always look from start toward goal
+        azim = np.degrees(np.arctan2(cam_dir[1], cam_dir[0])) - 180
+        ax.view_init(elev=32, azim=azim)
+        ax.set_title(f"Agent Traverse | frame {frame_i + 1}/{max_len}")
+        return list(agents.values()) + list(trails.values())
 
-        lookback = pts[max(frame_i - 4, 0)]
-        direction = pos - lookback
-        if np.linalg.norm(direction[:2]) > 1e-6:
-            last_heading[0] = float(np.degrees(np.arctan2(direction[1], direction[0])))
-
-        center = pos
-        span = max(150.0, 0.15 * WORLD_SCALE)
-        ax.set_xlim(center[0] - span, center[0] + span)
-        ax.set_ylim(center[1] - span, center[1] + span)
-        ax.set_zlim(max(SPACE_BOUNDS[4], center[2] - 0.45 * span), min(SPACE_BOUNDS[5], center[2] + 0.45 * span))
-        target_azim = last_heading[0] + 180.0
-        delta = ((target_azim - current_azim[0] + 180.0) % 360.0) - 180.0
-        current_azim[0] += 0.16 * delta
-        ax.view_init(elev=36, azim=current_azim[0])
-        ax.set_title(f"Agent Traverse | frame {frame_i + 1}/{len(pts)}")
-        return agent, trail
-
-    anim = FuncAnimation(fig, update, frames=len(pts), interval=int(1000 / fps), blit=False)
+    anim = FuncAnimation(fig, update, frames=max_len, interval=int(1000 / fps), blit=False)
     anim.save(output_path, writer=PillowWriter(fps=fps))
     plt.close(fig)
 
@@ -892,18 +658,6 @@ def collision_constraint_values(x, boxes, clearance=COLLISION_CLEARANCE, n_check
         values.append(min_dist - clearance)
     return np.asarray(values, dtype=float)
 
-
-def densify_path_nodes(path_nodes, refinement_level):
-    nodes = [np.array(p, dtype=float) for p in path_nodes]
-    for _ in range(refinement_level):
-        dense = [nodes[0]]
-        for a, b in zip(nodes[:-1], nodes[1:]):
-            dense.append(0.5 * (a + b))
-            dense.append(b)
-        nodes = dense
-    return [tuple(p) for p in nodes]
-
-
 def build_bounds_and_initial_guess(opt_nodes, margin):
     lb_local = []
     ub_local = []
@@ -960,10 +714,14 @@ def summarize_solution(label, x_sol):
     }
 
 
+
+# Deep copy of swarm history (for animation)
 def clone_swarm_history(history):
     return [np.array(frame, dtype=float).copy() for frame in history]
 
 
+
+# Helper for sorting candidate evaluations
 def score_candidate_eval(eval_data):
     return (
         int(eval_data["exact_hits"]),
@@ -972,6 +730,8 @@ def score_candidate_eval(eval_data):
     )
 
 
+
+# Extract metrics from swarm history for plotting
 def history_metrics_from_swarm(history):
     length_history = []
     curvature_history = []
@@ -985,6 +745,8 @@ def history_metrics_from_swarm(history):
     return length_history, curvature_history, hit_history
 
 
+
+# Extract metrics from state history for plotting
 def history_metrics_from_states(history):
     length_history = []
     curvature_history = []
@@ -1235,36 +997,9 @@ def optimize_portals(start_xyz, goal_xyz, portals, return_history=False):
     return (result, history) if return_history else result
 
 def run_gcs_planner(plot=True, save_plot=True, save_gif=False):
-    rng = np.random.default_rng(7)
-    start = sample_free_point(
-        rng,
-        BOXES,
-        (SPACE_BOUNDS[0], SPACE_BOUNDS[1]),
-        (SPACE_BOUNDS[2], SPACE_BOUNDS[3]),
-        (START_Z, START_Z),
-        xy_margin=0.05 * WORLD_SCALE,
-        z_margin=0.0,
-    )
-    GOAL_Z = 0.5 * SPACE_BOUNDS[5]
-    goal = sample_free_point(
-        rng,
-        BOXES,
-        (SPACE_BOUNDS[0], SPACE_BOUNDS[1]),
-        (SPACE_BOUNDS[2], SPACE_BOUNDS[3]),
-        (GOAL_Z, GOAL_Z),
-        xy_margin=0.05 * WORLD_SCALE,
-        z_margin=0.0,
-    )
-    while math.dist(start, goal) < 0.20 * WORLD_SCALE:
-        goal = sample_free_point(
-            rng,
-            BOXES,
-            (SPACE_BOUNDS[0], SPACE_BOUNDS[1]),
-            (SPACE_BOUNDS[2], SPACE_BOUNDS[3]),
-            (GOAL_Z, GOAL_Z),
-            xy_margin=0.05 * WORLD_SCALE,
-            z_margin=0.0,
-        )
+    # Use the same handpicked START and GOAL as the main scenario
+    start = START
+    goal = GOAL
     print(f"Start: {start}")
     print(f"Goal:  {goal}")
     print("Building 3D convex decomposition...")
@@ -1326,6 +1061,7 @@ def run_gcs_planner(plot=True, save_plot=True, save_gif=False):
         ax.set_ylim(SPACE_BOUNDS[2], SPACE_BOUNDS[3])
         ax.set_zlim(SPACE_BOUNDS[4], SPACE_BOUNDS[5])
         ax.set_box_aspect((1, 1, 0.55))
+        # Default view: above and behind the start corner
         ax.view_init(elev=24, azim=-58)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
@@ -1334,6 +1070,19 @@ def run_gcs_planner(plot=True, save_plot=True, save_gif=False):
         if save_plot:
             plt.savefig(plot_path, dpi=200, bbox_inches="tight")
             print(f"Saved plot to {plot_path}")
+
+        # Save top-down view
+        ax.view_init(elev=90, azim=-90)
+        topdown_path = os.path.join(os.path.dirname(__file__), "gcs_topdown.png")
+        plt.savefig(topdown_path, dpi=200, bbox_inches="tight")
+        print(f"Saved top-down view to {topdown_path}")
+
+        # Save above and behind start corner view
+        ax.view_init(elev=32, azim=-148)
+        behind_path = os.path.join(os.path.dirname(__file__), "gcs_behind_start.png")
+        plt.savefig(behind_path, dpi=200, bbox_inches="tight")
+        print(f"Saved above/behind start view to {behind_path}")
+
         plt.show()
     return {
         "start": start,
@@ -1379,29 +1128,11 @@ if x0 is None:
 print(f"Optimization dim: {len(lb)}")
 print(f"Using feasible initial seed from {seed_name} with {len(opt_nodes)} waypoints")
 
-
 results = {}
 
-if RUN_PSO_CURRENT:
-    print("Running current PSO...")
-    x_cur, _, _ = particle_swarm(
-        objective,
-        lb,
-        ub,
-        n=20,
-        max_vel=5.0,
-        max_iters=240,
-        progress_every=20,
-    )
-    cur_eval = evaluate_candidate(x_cur)
-    results["current"] = {"x": x_cur, "eval": cur_eval, "history": clone_swarm_history(X_history)}
-    print(f"Current PSO: obj={cur_eval['objective']:.2f}, length={cur_eval['length']:.2f}, hits={cur_eval['exact_hits']}")
-else:
-    cur_eval = None
-
-if RUN_PSO_LEGACY:
-    print("Running legacy PSO...")
-    x_leg, _, _ = particle_swarm_legacy(
+if RUN_PSO:
+    print("Running PSO...")
+    x_leg, _, _ = particle_swarm(
         objective,
         lb,
         ub,
@@ -1410,60 +1141,71 @@ if RUN_PSO_LEGACY:
         max_iters=240,
     )
     leg_eval = evaluate_candidate(x_leg)
-    results["legacy"] = {"x": x_leg, "eval": leg_eval, "history": clone_swarm_history(X_history)}
-    print(f"Legacy PSO: obj={leg_eval['objective']:.2f}, length={leg_eval['length']:.2f}, hits={leg_eval['exact_hits']}")
+    results["PSO"] = {"x": x_leg, "eval": leg_eval, "history": clone_swarm_history(X_history)}
+    print(f"PSO: obj={leg_eval['objective']:.2f}, length={leg_eval['length']:.2f}, hits={leg_eval['exact_hits']}")
 else:
     leg_eval = None
 
-if RUN_PSO_6_4:
-    print("Running 6_4 PSO...")
-    x_64, _, _ = particle_swarm_6_4(
-        objective,
-        lb,
-        ub,
-        n=20,
-        max_vel=5.0,
-    )
-    eval_64 = evaluate_candidate(x_64)
-    results["6_4"] = {"x": x_64, "eval": eval_64, "history": clone_swarm_history(X_history)}
-    print(f"6_4 PSO: obj={eval_64['objective']:.2f}, length={eval_64['length']:.2f}, hits={eval_64['exact_hits']}")
-else:
-    eval_64 = None
-
 if not results:
-    raise RuntimeError("All PSO variants are disabled. Enable at least one RUN_PSO_* toggle.")
-
+    raise RuntimeError("PSO is disabled. Enable RUN_PSO toggle.")
 
 def better(eval_a, eval_b):
     if eval_a["exact_hits"] != eval_b["exact_hits"]:
         return eval_a["exact_hits"] < eval_b["exact_hits"]
     return eval_a["objective"] < eval_b["objective"]
 
-# Compare enabled PSOs
-best_name = None
-best_eval = None
-x_pso = None
-pso_eval = None
-selected_pso_history = []
-for name, data in results.items():
-    cand_eval = data["eval"]
-    if best_eval is None or better(cand_eval, best_eval):
-        best_name = name
-        best_eval = cand_eval
-        x_pso = data["x"]
-        pso_eval = cand_eval
-        selected_pso_history = data["history"]
 
-print(f"Selected {best_name} PSO output")
+def curvature_constraint(x):
+    x_s, y_s, z_s, _, curvature, _ = build_spline_from_x(x, n_samples=COLLISION_CONSTRAINT_SAMPLES)
+    kappa_max = 1.0 / RHO
+    return kappa_max - np.max(curvature)
+
+
+def cylindrical_boundary_constraint(x, boxes=BOXES, n_checks=COLLISION_CONSTRAINT_SAMPLES):
+    """
+    Enforce that all path points are outside a cylinder (in x-y) around each box.
+    Cylinder center: box x-y center; radius: half the x-y diagonal of the box.
+    Returns: array of min distance from each path sample to the surface of all cylinders (should be >= 0).
+    """
+    x_s, y_s, z_s, _, _, _ = build_spline_from_x(x, n_samples=n_checks)
+    total = len(x_s)
+    if total == 0:
+        return np.array([], dtype=float)
+
+    n_checks = max(2, min(int(n_checks), total))
+    indices = np.linspace(0, total - 1, n_checks, dtype=int)
+
+    values = []
+    for idx in indices:
+        px, py = x_s[idx], y_s[idx]
+        # For each box, compute cylinder center and radius
+        min_dist = float('inf')
+        for box in boxes:
+            x0, y0, _, x1, y1, _ = box
+            cx = 0.5 * (x0 + x1)
+            cy = 0.5 * (y0 + y1)
+            dx = x1 - x0
+            dy = y1 - y0
+            radius = 0.5 * np.sqrt(dx**2 + dy**2)
+            dist = np.sqrt((px - cx)**2 + (py - cy)**2) - radius
+            if dist < min_dist:
+                min_dist = dist
+        values.append(min_dist)
+    return np.asarray(values, dtype=float)
 
 def run_ipm_from_seed(seed_x, label):
     print(f"Running interior-point method from {label}...")
     constraints = [
         NonlinearConstraint(
-            lambda x: collision_constraint_values(x, BOXES, clearance=COLLISION_CLEARANCE),
+            cylindrical_boundary_constraint,
             0.0,
             np.inf,
-        )
+        ),
+        NonlinearConstraint(
+            curvature_constraint,
+            0.0,
+            np.inf,
+        ),
     ]
     history = [np.array(seed_x, dtype=float).copy()]
 
@@ -1503,7 +1245,7 @@ else:
 
 ipm_pso_result = None
 if RUN_IPM_ON_TOP_OF_PSO:
-    ipm_pso_result = run_ipm_from_seed(x_pso, "IPM (PSO seed)")
+    ipm_pso_result = run_ipm_from_seed(x_leg, "IPM (PSO seed)")
 else:
     print("Skipping interior-point refinement from PSO (RUN_IPM_ON_TOP_OF_PSO=False).")
 
@@ -1515,13 +1257,14 @@ if RUN_GCS:
 else:
     print("Skipping GCS planner (RUN_GCS=False).")
 
-print("Allowed:", 1.0 / RHO)
-print("PSO objective:", pso_eval["objective"])
-print("PSO length:", pso_eval["length"])
-print("PSO max curvature:", pso_eval["max_curvature"])
 
-pso_exact_hits, pso_exact_first = final_collision_audit(pso_eval["path_curve"], BOXES, margin=0.0)
-pso_buffer_hits, pso_buffer_first = final_collision_audit(pso_eval["path_curve"], BOXES, margin=IPM_ACCEPT_MARGIN)
+print("Allowed:", 1.0 / RHO)
+print("PSO objective:", leg_eval["objective"])
+print("PSO length:", leg_eval["length"])
+print("PSO max curvature:", leg_eval["max_curvature"])
+
+pso_exact_hits, pso_exact_first = final_collision_audit(leg_eval["path_curve"], BOXES, margin=0.0)
+pso_buffer_hits, pso_buffer_first = final_collision_audit(leg_eval["path_curve"], BOXES, margin=IPM_ACCEPT_MARGIN)
 print(f"PSO collision check (exact boxes): {'COLLISION' if pso_exact_hits > 0 else 'clear'} | hits={pso_exact_hits}")
 if pso_exact_first is not None:
     bi, seg_i, p = pso_exact_first
@@ -1547,6 +1290,11 @@ if gcs_result is not None:
     print("GCS objective (length):", gcs_result["length"])
     print("GCS max curvature:", gcs_result["max_curvature"])
 
+
+# Define selected_pso_history and pso_eval for plotting and metrics
+selected_pso_history = results["PSO"]["history"] if "PSO" in results and "history" in results["PSO"] else []
+pso_eval = leg_eval
+
 # History summaries for the comparison chart.
 pso_length_history, pso_curvature_history, pso_hit_history = history_metrics_from_swarm(selected_pso_history)
 ipm_rrt_length_history, ipm_rrt_curvature_history, ipm_rrt_hit_history = ([], [], [])
@@ -1563,6 +1311,7 @@ gcs_hit_history = gcs_result["hit_history"] if gcs_result is not None else []
 # Use PSO path for traversal visualization while plotting all methods side-by-side.
 path_curve = pso_eval["path_curve"]
 
+
 gif_path = os.path.join(os.path.dirname(__file__), "pathfinder_pso_path_evolution.gif")
 if SAVE_GIFS:
     print("Saving PSO path-evolution GIF...")
@@ -1571,13 +1320,21 @@ if SAVE_GIFS:
 else:
     print("Skipping PSO path-evolution GIF (SAVE_GIFS=False)")
 
-traverse_gif_path = os.path.join(os.path.dirname(__file__), "pathfinder_pso_agent_traverse.gif")
+traverse_gif_path = os.path.join(os.path.dirname(__file__), "pathfinder_agents_traverse.gif")
 if SAVE_GIFS:
-    print("Saving PSO agent-traverse GIF...")
-    visualize_agent_traverse(path_curve, traverse_gif_path)
+    print("Saving multi-agent traverse GIF...")
+    paths_dict = {}
+    paths_dict['PSO'] = pso_eval["path_curve"]
+    if PLOT_IPM_FROM_RRT and ipm_rrt_result is not None:
+        paths_dict['IPM (RRT seed)'] = ipm_rrt_result["eval"]["path_curve"]
+    if PLOT_PSO_IPM and ipm_pso_result is not None:
+        paths_dict['PSO + IPM'] = ipm_pso_result["eval"]["path_curve"]
+    if PLOT_GCS and gcs_result is not None:
+        paths_dict['GCS'] = gcs_result["path_curve"]
+    visualize_agents_multi(paths_dict, traverse_gif_path)
     print(f"Saved GIF to {traverse_gif_path}")
 else:
-    print("Skipping PSO agent-traverse GIF (SAVE_GIFS=False)")
+    print("Skipping agent traverse GIF (SAVE_GIFS=False)")
 
 # ── Plot optimized results ────────────────────────────────────────────────
 fig = plt.figure(figsize=(11, 9))
@@ -1586,6 +1343,13 @@ ax.set_facecolor('#0d0d1a')
 
 for box in BOXES:
     add_box(ax, box)
+
+
+# Plot RRT and pruned RRT paths
+rrt_arr = np.array(rrt_path)
+ax.plot(rrt_arr[:,0], rrt_arr[:,1], rrt_arr[:,2], color='#bbbbbb', lw=1.5, linestyle='-', label='RRT')
+rrt_pruned_arr = np.array(rrt_pruned)
+ax.plot(rrt_pruned_arr[:,0], rrt_pruned_arr[:,1], rrt_pruned_arr[:,2], color='#888888', lw=2.0, linestyle='--', label='RRT (pruned)')
 
 ax.plot(pso_eval["x_s"], pso_eval["y_s"], pso_eval["z_s"], color='#ffd166', lw=2.6, label='PSO (selected)')
 
