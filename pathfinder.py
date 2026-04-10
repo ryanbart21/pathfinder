@@ -23,7 +23,7 @@ N_BOXES = 14
 BOX_SEED = 23
 SAVE_GIFS = True
 COLLISION_CLEARANCE = 0.0
-COLLISION_CONSTRAINT_SAMPLES = 400
+COLLISION_CONSTRAINT_SAMPLES = 600
 Z_HEADROOM = 10.0
 IPM_MAX_ITERS = 100
 IPM_ACCEPT_MARGIN = 0.3
@@ -1638,7 +1638,8 @@ def align_history(history, horizon):
         return [np.nan] * horizon
     aligned = list(history)
     if len(aligned) < horizon:
-        aligned.extend([aligned[-1]] * (horizon - len(aligned)))
+        # Pad with NaN so the plotted line ends at the method's last iteration.
+        aligned.extend([np.nan] * (horizon - len(aligned)))
     return aligned[:horizon]
 
 pso_length_history = align_history(pso_length_history, metrics_horizon)
