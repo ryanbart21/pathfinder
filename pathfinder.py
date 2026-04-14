@@ -231,29 +231,11 @@ rrt_path = rrt(START, GOAL, BOXES)
 if rrt_path is None:
     raise RuntimeError("RRT failed to find a path — try increasing n_iter")
 print(f"  RRT: {len(rrt_path)} nodes")
+rrt_xs, rrt_ys, rrt_zs, _, _, _, _, _, _ = build_bspline(rrt_path, n_samples=200)
+rrt_full_length = curve_length_from_samples(rrt_xs, rrt_ys, rrt_zs)
+print(f"  RRT length: {rrt_full_length:.2f}")
 
-# ── Prune collinear points ──────────────────────────────────────────────────
-def prune(path, boxes, mg=RHO+0.75):
-    """Remove waypoints that can be skipped without collision."""
-    pruned = [path[0]]
-    i = 0
-    while i < len(path)-1:
-        j = len(path)-1
-        while j > i+1:
-            if seg_clear(
-                path[i][0], path[i][1], path[i][2],
-                path[j][0], path[j][1], path[j][2],
-                boxes, mg,
-            ):
-                break
-            j -= 1
-        pruned.append(path[j]); i = j
-    return pruned
-
-rrt_pruned = prune(rrt_path, BOXES)
-print(f"  After pruning: {len(rrt_pruned)} nodes")
-
-def particle_swarm(f, x_lb, x_ub, seed_x=None, n=20, inertia=0.5, self_influence=1.8, social_influence=1.8, max_vel=5.0, f_tol=1e-6, max_iters=300, stall_iters=25):
+def particle_swarm(f, x_lb, x_ub, seed_x=None, n=20, inertia=0.5, self_influence=1.8, social_influence=1.8, max_vel=5.0, f_tol=1e-6, max_iters=300, stall_iters=25, local_init_frac=0.5):
     global nfev
     global X_history
     nfev = 0
@@ -264,13 +246,23 @@ def particle_swarm(f, x_lb, x_ub, seed_x=None, n=20, inertia=0.5, self_influence
     else:
         seed_x = np.array(seed_x, dtype=float)
 
-    lhs_raw = lhsmdu.sample(len(x_lb), n)
+    dim = len(x_lb)
+    lhs_raw = lhsmdu.sample(dim, n)
     lhs_samples = np.array(lhs_raw).T
+    # Start with globally distributed particles over the full provided bounds.
     X = x_lb + (x_ub - x_lb) * lhs_samples
     X[0, :] = seed_x.copy()
+
+    # Keep a subset of particles near the RRT seed for exploitation.
+    n_local = int(max(1, min(n - 1, round((n - 1) * local_init_frac))))
+    if n_local > 0:
+        sigma = 0.08 * (x_ub - x_lb)
+        local_noise = np.random.randn(n_local, dim) * sigma
+        X[1:1 + n_local, :] = seed_x[None, :] + local_noise
+    X = np.maximum(np.minimum(X, x_ub), x_lb)
     dX = (np.random.rand(n, len(x_lb)) * 2 - 1) * max_vel
     X_best = X.copy()
-    best_evals = [evaluate_candidate(np.array(xi, dtype=float)) for xi in X_best]
+    best_evals = [evaluate_candidate(np.array(xi, dtype=float), objective_fn=f) for xi in X_best]
     nfev += len(X_best)
 
     feasible_best_x = None
@@ -286,14 +278,16 @@ def particle_swarm(f, x_lb, x_ub, seed_x=None, n=20, inertia=0.5, self_influence
     converged = False
 
     for _ in range(max_iters):
-        current_evals = [evaluate_candidate(np.array(xi, dtype=float)) for xi in X]
+        current_evals = [evaluate_candidate(np.array(xi, dtype=float), objective_fn=f) for xi in X]
         nfev += len(X)
         current_scores = [score_candidate_eval(eval_data) for eval_data in current_evals]
-        feasible_indices = [idx for idx, eval_data in enumerate(current_evals) if int(eval_data["exact_hits"]) == 0]
+        # Global-best should come from personal-best memory, not only current positions.
+        pbest_scores = [score_candidate_eval(eval_data) for eval_data in best_evals]
+        feasible_indices = [idx for idx, eval_data in enumerate(best_evals) if int(eval_data["exact_hits"]) == 0]
         if feasible_indices:
-            swarm_best_i = min(feasible_indices, key=lambda idx: current_scores[idx])
+            swarm_best_i = min(feasible_indices, key=lambda idx: pbest_scores[idx])
         else:
-            swarm_best_i = min(range(n), key=lambda idx: current_scores[idx])
+            swarm_best_i = min(range(n), key=lambda idx: pbest_scores[idx])
 
         for i in range(n):
             if current_scores[i] < score_candidate_eval(best_evals[i]):
@@ -341,14 +335,16 @@ def particle_swarm(f, x_lb, x_ub, seed_x=None, n=20, inertia=0.5, self_influence
     return r_x, float(best_evals[best_index]["objective"]), nfev
 
 
-def evaluate_candidate(x):
+def evaluate_candidate(x, objective_fn=None):
+    if objective_fn is None:
+        objective_fn = objective
     x_s, y_s, z_s, length, curvature, _ = build_spline_from_x(x)
     path_curve = np.column_stack((x_s, y_s, z_s))
     exact_hits, _ = final_collision_audit(path_curve, BOXES, margin=0.0)
     margin_hits, _ = final_collision_audit(path_curve, BOXES, margin=IPM_ACCEPT_MARGIN)
     max_curvature = float(np.max(curvature))
     return {
-        "objective": float(objective(x)),
+        "objective": float(objective_fn(x)),
         "length": float(length),
         "max_curvature": max_curvature,
         "max_curvature_violation": float(max(0.0, max_curvature - (1.0 / RHO))),
@@ -563,7 +559,6 @@ def visualize_agents_multi(paths_dict, output_path, max_frames=120, fps=64):
     # Plot all full paths
     colors = {
         'RRT': '#cfd3d6',
-        'RRT (pruned)': '#8f98a3',
         'PSO': '#ffd166',
         'IPM (RRT seed)': '#ff8c42',
         'PSO + IPM': '#2ecc71',
@@ -1404,22 +1399,16 @@ def run_gcs_planner(plot=True, save_plot=True, save_gif=False):
     }
 
 # ── Run PSO with RRT-seeded feasible initialization ────────────────────────
-rrt_seed_candidates = [rrt_pruned[1:-1], rrt_path[1:-1]]
-seed_name = None
-opt_nodes = None
+seed_name = "full RRT"
+opt_nodes = rrt_path[1:-1]
 lb = None
 ub = None
 x0 = None
 
-for name, candidate_nodes in [("pruned RRT", rrt_seed_candidates[0]), ("full RRT", rrt_seed_candidates[1])]:
-    if len(candidate_nodes) == 0:
-        continue
-    lb_c, ub_c, x0_c = build_bounds_and_initial_guess(candidate_nodes, margin)
+if len(opt_nodes) > 0:
+    lb_c, ub_c, x0_c = build_bounds_and_initial_guess(opt_nodes, margin)
     if is_collision_free_solution(x0_c):
-        seed_name = name
-        opt_nodes = candidate_nodes
         lb, ub, x0 = lb_c, ub_c, x0_c
-        break
 
 if x0 is None:
     raise RuntimeError("No feasible RRT-seeded initial solution found. Try increasing RRT n_iter or LOCAL_BOUNDS_MARGIN.")
@@ -1435,12 +1424,13 @@ if RUN_PSO:
     print(f"  Seed collision check: exact_hits={seed_eval['exact_hits']}, objective={seed_eval['objective']:.2f}")
     x_leg, _, _ = particle_swarm(
         objective,
-        lb,
-        ub,
+        np.tile(np.array([SPACE_BOUNDS[0], SPACE_BOUNDS[2], SPACE_BOUNDS[4]], dtype=float), len(opt_nodes)),
+        np.tile(np.array([SPACE_BOUNDS[1], SPACE_BOUNDS[3], SPACE_BOUNDS[5]], dtype=float), len(opt_nodes)),
         seed_x=x0,
-        n=20,
-        max_vel=5.0,
+        n=56,
+        max_vel=12.0,
         max_iters=240,
+        local_init_frac=0.45,
     )
     leg_eval = evaluate_candidate(x_leg)
     results["PSO"] = {"x": x_leg, "eval": leg_eval, "history": clone_swarm_history(X_history)}
@@ -1620,9 +1610,10 @@ gcs_hit_history = gcs_result["hit_history"] if gcs_result is not None else []
 
 # RRT baseline metrics for history plots (constant reference lines),
 # evaluated with the same spline-sampled representation used elsewhere.
-rrt_eval = evaluate_waypoint_path(rrt_pruned, n_samples=200)
+rrt_eval = evaluate_waypoint_path(rrt_path, n_samples=200)
 rrt_length = rrt_eval["length"]
 rrt_max_curvature = rrt_eval["max_curvature"]
+rrt_plot_curve = np.asarray(rrt_eval["path_curve"], dtype=float)
 metrics_horizon = max(
     1,
     len(pso_length_history),
@@ -1660,7 +1651,7 @@ if pso_eval is not None:
 elif gcs_result is not None:
     path_curve = gcs_result["path_curve"]
 else:
-    path_curve = np.asarray(rrt_pruned, dtype=float)
+    path_curve = np.asarray(rrt_path, dtype=float)
 
 
 gif_path = os.path.join(os.path.dirname(__file__), "pathfinder_pso_path_evolution.gif")
@@ -1675,7 +1666,7 @@ traverse_gif_path = os.path.join(os.path.dirname(__file__), "pathfinder_agents_t
 if SAVE_GIFS:
     print("Saving multi-agent traverse GIF...")
     paths_dict = {}
-    paths_dict['RRT (pruned)'] = np.asarray(rrt_pruned, dtype=float)
+    paths_dict['RRT'] = rrt_plot_curve
     if pso_eval is not None:
         paths_dict['PSO'] = pso_eval["path_curve"]
     if PLOT_IPM_FROM_RRT and ipm_rrt_result is not None:
@@ -1698,9 +1689,9 @@ for box in BOXES:
     add_box(ax, box)
 
 
-# Plot pruned RRT path only
-rrt_pruned_arr = np.array(rrt_pruned)
-ax.plot(rrt_pruned_arr[:,0], rrt_pruned_arr[:,1], rrt_pruned_arr[:,2], color='#9aa3ad', lw=2.8, linestyle='--', label='RRT (pruned)', zorder=21)
+# Plot full RRT path
+rrt_arr = rrt_plot_curve
+ax.plot(rrt_arr[:,0], rrt_arr[:,1], rrt_arr[:,2], color='#9aa3ad', lw=2.8, linestyle='--', label='RRT', zorder=21)
 
 if pso_eval is not None:
     ax.plot(pso_eval["x_s"], pso_eval["y_s"], pso_eval["z_s"], color='#ffd166', lw=2.6, label='PSO (selected)')
@@ -1764,7 +1755,7 @@ for box in BOXES:
     ax_be.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor='#922b21', edgecolor='#e74c3c', alpha=0.35, linewidth=0.8))
 
 topdown_series = [
-    ('RRT (pruned)', rrt_pruned_arr, '#9aa3ad', '--'),
+    ('RRT', rrt_arr, '#9aa3ad', '--'),
 ]
 if pso_eval is not None:
     topdown_series.append(('PSO', np.column_stack((pso_eval['x_s'], pso_eval['y_s'])), '#ffd166', '-'))
@@ -1797,7 +1788,7 @@ ax_len.set_facecolor('#0d0d1a')
 ax_curv.set_facecolor('#0d0d1a')
 
 series = [
-    ("RRT (pruned)", rrt_length_history, rrt_curvature_history, '#9aa3ad', '--'),
+    ("RRT", rrt_length_history, rrt_curvature_history, '#9aa3ad', '--'),
     ("PSO", pso_length_history, pso_curvature_history, '#ffd166', '-'),
     ("IPM (RRT seed)", ipm_rrt_length_history, ipm_rrt_curvature_history, '#ff8c42', '--'),
     ("PSO + IPM", ipm_pso_length_history, ipm_pso_curvature_history, '#2ecc71', ':'),
